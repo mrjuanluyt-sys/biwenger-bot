@@ -96,6 +96,17 @@ Automatizar la cuenta puede chocar con las normas de Biwenger (riesgo de ban, no
 
 No está afiliado a Biwenger ni a Diario AS.
 
+## 24/7 gratis (GitHub Actions)
+
+El PC no hace falta. Cada 5 minutos GitHub corre `scripts/tick.py`: lee Telegram, dispara pujas al cierre y el briefing diario.
+
+1. Repo **privado** (el token de Biwenger no puede ser público).
+2. Secrets en *Settings → Secrets and variables → Actions* (los mismos nombres que en `.env`).
+3. Actions → *biwenger-tick* → *Run workflow* la primera vez.
+4. **No** dejes `python main.py` a la vez: Telegram solo admite un `getUpdates`.
+
+Respuesta en el chat: como mucho 5 minutos. Sigue en `DRY_RUN` hasta que digas lo contrario.
+
 ## Tests
 
 ```

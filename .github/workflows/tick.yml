@@ -1,0 +1,64 @@
+name: biwenger-tick
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: biwenger-tick
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore state
+        continue-on-error: true
+        run: |
+          git fetch origin bot-state:bot-state || true
+          mkdir -p data
+          if git show bot-state:state.json >/dev/null 2>&1; then
+            git show bot-state:state.json > data/state.json
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python scripts/tick.py
+        env:
+          BIWENGER_TOKEN: ${{ secrets.BIWENGER_TOKEN }}
+          BIWENGER_LEAGUE_ID: ${{ secrets.BIWENGER_LEAGUE_ID }}
+          BIWENGER_USER_ID: ${{ secrets.BIWENGER_USER_ID }}
+          BIWENGER_APP_VERSION: ${{ secrets.BIWENGER_APP_VERSION }}
+          BIWENGER_COMPETITION: ${{ secrets.BIWENGER_COMPETITION }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN: ${{ secrets.DRY_RUN }}
+          BUDGET_SAFETY_MARGIN: ${{ secrets.BUDGET_SAFETY_MARGIN }}
+          DAILY_BRIEFING_HOUR: ${{ secrets.DAILY_BRIEFING_HOUR }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+
+      - name: Persist state
+        if: always()
+        run: |
+          test -f data/state.json || exit 0
+          git config user.name "biwenger-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          work=$(mktemp -d)
+          cp data/state.json "$work/state.json"
+          git -C "$work" init -q
+          git -C "$work" checkout -q -b bot-state
+          git -C "$work" add state.json
+          git -C "$work" -c user.name="biwenger-bot" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -qm "state"
+          git -C "$work" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          git -C "$work" push -fq "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" bot-state:bot-state
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
