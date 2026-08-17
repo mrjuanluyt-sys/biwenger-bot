@@ -64,7 +64,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Chain next
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           queued=$(gh run list --workflow biwenger-live --status queued --json databaseId --jq 'length')
           if [ "$queued" != "0" ]; then
