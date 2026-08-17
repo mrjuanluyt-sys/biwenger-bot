@@ -25,7 +25,7 @@ UA = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 BLOG_FEED = "https://biwenger.as.com/blog/feed/"
-CACHE_TTL = 45 * 60
+CACHE_TTL = 90 * 60
 
 
 @dataclass
@@ -202,6 +202,7 @@ def collect(client) -> Intel:
         if not url:
             continue
         try:
+            time.sleep(1.0)
             html = _get(url)
             starters, unav = parse_preview(html)
             intel.starters.update(starters)

@@ -13,7 +13,7 @@ from .market import Target, find_targets
 from .models import ManagerBudget, MarketListing, Offer, Player, TeamState, UpcomingFixture
 
 _CACHE: tuple[float, "Snap"] | None = None
-CACHE_TTL = 90.0
+CACHE_TTL = 8 * 60.0
 
 
 def fill_buy_prices(players: list[Player], moves) -> None:
@@ -48,6 +48,17 @@ def gather(client: BiwengerClient, force: bool = False) -> Snap:
     now = time.time()
     if not force and _CACHE and now - _CACHE[0] < CACHE_TTL:
         return _CACHE[1]
+    try:
+        return _gather_fresh(client)
+    except Exception as exc:
+        from .client import BiwengerRateLimit
+
+        if _CACHE and isinstance(exc, BiwengerRateLimit):
+            return _CACHE[1]
+        raise
+
+
+def _gather_fresh(client: BiwengerClient) -> Snap:
     team, squad, catalog = client.enrich_my_squad()
     client.attach_league_owners(catalog)
     enrich_catalog(client, catalog)
@@ -64,7 +75,7 @@ def gather(client: BiwengerClient, force: bool = False) -> Snap:
     clause_cash = max(balance, 0)
     targets = find_targets(listings, catalog, squad, market_cap, clause_cash=clause_cash)
     standings = client.get_standings()
-    news = client.get_season_news(SEASON_START, max_pages=16)
+    news = client.get_season_news(SEASON_START, max_pages=4)
     moves = parse_moves(news, since=last_reset_epoch(news) or SEASON_START)
     fill_buy_prices(list(catalog.values()), moves)
     league_settings = client.get_league_settings()
@@ -97,7 +108,7 @@ def gather(client: BiwengerClient, force: bool = False) -> Snap:
         offers=offers,
         n_managers=n_mgr,
     )
-    _CACHE = (now, snap)
+    _CACHE = (time.time(), snap)
     return snap
 
 

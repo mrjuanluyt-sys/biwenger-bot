@@ -32,9 +32,9 @@ TZ = ZoneInfo("Europe/Madrid")
 
 # Dejar margen para persistir y lanzar el siguiente job (límite Actions = 6 h).
 RUN_SECONDS = 5 * 3600 + 40 * 60
-JOBS_EVERY = 45
-PERSIST_EVERY = 180
-RELOGIN_EVERY = 30 * 60
+JOBS_EVERY = 15 * 60
+PERSIST_EVERY = 15 * 60
+RELOGIN_EVERY = 45 * 60
 
 
 def persist_remote() -> None:
@@ -108,6 +108,8 @@ def main() -> int:
             log.exception("jobs login")
             jobs = client
         last_login = time.time()
+        # No martillar Biwenger al arrancar: Telegram sí, la API no.
+        stop.wait(8 * 60)
         while not stop.is_set() and time.time() < deadline:
             if time.time() - last_login > RELOGIN_EVERY:
                 try:
@@ -119,7 +121,7 @@ def main() -> int:
                 from biwenger.alerts import scan
                 from biwenger.snap import gather
 
-                snap = gather(jobs, force=True)
+                snap = gather(jobs, force=False)
                 for note, buttons in scan(snap):
                     tg.send_message(note, buttons)
                     log.info("alerta: %s", note.splitlines()[0][:80])

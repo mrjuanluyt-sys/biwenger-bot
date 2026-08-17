@@ -423,7 +423,14 @@ def handle_chat(text: str, client: BiwengerClient) -> tuple[str, list[Button] | 
     if not raw:
         return "Dime qué quieres mirar: once, mercado, cláusulas, dinero de la liga o un jugador.", None
 
-    snap = gather(client)
+    try:
+        snap = gather(client)
+    except Exception as exc:
+        from .client import BiwengerRateLimit
+
+        if isinstance(exc, BiwengerRateLimit):
+            return f"🛑 {exc}", None
+        raise
     intent = detect_intent(raw)
     pos = detect_position(raw)
     mentioned = match_players(raw, snap.catalog)

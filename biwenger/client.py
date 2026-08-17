@@ -6,10 +6,13 @@ la petición equivalente.
 """
 from __future__ import annotations
 
+import json
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -45,6 +48,52 @@ class BiwengerAuthError(BiwengerError):
 
 class BiwengerVersionError(BiwengerError):
     pass
+
+
+class BiwengerRateLimit(BiwengerError):
+    pass
+
+
+# Un solo ritmo para todos los clientes del proceso (live usa dos hilos).
+_HTTP_LOCK = threading.Lock()
+_LAST_REQUEST = 0.0
+_COOL_UNTIL = 0.0
+_GET_CACHE: dict[str, tuple[float, Any]] = {}
+MIN_INTERVAL = 1.3
+
+
+def cache_ttl(url: str) -> int:
+    path = urlparse(url).path
+    if "/news" in path:
+        return 900
+    if "/competitions/" in path:
+        return 600
+    if "/rounds/" in path:
+        return 600
+    if "/user/" in path:
+        return 720
+    if path.rstrip("/").endswith("/user"):
+        return 90
+    if "/market" in path:
+        return 90
+    if "/offers" in path:
+        return 90
+    if "/league" in path:
+        return 300
+    return 60
+
+
+def _cache_key(method: str, url: str, params: Any) -> str:
+    return f"{method}|{url}|{json.dumps(params or {}, sort_keys=True, default=str)}"
+
+
+def _looks_like_rate_limit(status: int, body: str) -> bool:
+    if status == 429:
+        return True
+    if status not in {403, 503, 502}:
+        return False
+    blob = (body or "").lower()
+    return any(w in blob for w in ("rate", "too many", "request", "limit", "bloque", "quota", "throttl"))
 
 
 class BiwengerClient:
@@ -163,9 +212,35 @@ class BiwengerClient:
             self._resolve_context()
 
     def _request(self, method: str, url: str, **kwargs: Any) -> Any:
+        global _LAST_REQUEST, _COOL_UNTIL
         self._ensure_auth()
         kwargs.setdefault("timeout", 20)
         kwargs.setdefault("headers", self._auth_headers())
+        verb = method.upper()
+        key = _cache_key(verb, url, kwargs.get("params"))
+        ttl = cache_ttl(url)
+        now = time.time()
+
+        if verb == "GET":
+            hit = _GET_CACHE.get(key)
+            if hit and now - hit[0] < ttl:
+                return hit[1]
+
+        with _HTTP_LOCK:
+            now = time.time()
+            if now < _COOL_UNTIL:
+                stale = _GET_CACHE.get(key)
+                if stale:
+                    logger.warning("cooldown activo, uso cache %s", url)
+                    return stale[1]
+                raise BiwengerRateLimit(
+                    f"Biwenger nos ha cortado. Espera {int(_COOL_UNTIL - now)} s y no abras la web."
+                )
+            wait = MIN_INTERVAL - (now - _LAST_REQUEST)
+            if wait > 0:
+                time.sleep(wait)
+            _LAST_REQUEST = time.time()
+
         resp = self._session.request(method, url, **kwargs)
         if resp.status_code == 400 and "version" in resp.text.lower():
             raise BiwengerVersionError(
@@ -177,14 +252,39 @@ class BiwengerClient:
                 self._token = None
                 self.login()
                 kwargs["headers"] = self._auth_headers()
+                with _HTTP_LOCK:
+                    time.sleep(MIN_INTERVAL)
+                    _LAST_REQUEST = time.time()
                 resp = self._session.request(method, url, **kwargs)
             else:
                 raise BiwengerAuthError(
                     "Token caducado. Saca uno nuevo: localStorage.getItem('satellizer_token')"
                 )
+        if _looks_like_rate_limit(resp.status_code, resp.text):
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                pause = max(int(retry_after), 30) if retry_after else 90
+            except ValueError:
+                pause = 90
+            _COOL_UNTIL = time.time() + pause
+            logger.warning("rate limit %s, pausa %ss", resp.status_code, pause)
+            stale = _GET_CACHE.get(key)
+            if stale:
+                return stale[1]
+            raise BiwengerRateLimit(
+                f"Biwenger bloqueó peticiones ({resp.status_code}). "
+                f"Para {pause}s. No entres a la web hasta entonces."
+            )
         if resp.status_code >= 400:
             raise BiwengerError(f"{method} {url} → {resp.status_code}: {resp.text[:300]}")
-        return resp.json() if resp.content else None
+        payload = resp.json() if resp.content else None
+        if verb == "GET" and payload is not None:
+            _GET_CACHE[key] = (time.time(), payload)
+            if len(_GET_CACHE) > 200:
+                oldest = sorted(_GET_CACHE.items(), key=lambda kv: kv[1][0])[:80]
+                for dead, _ in oldest:
+                    _GET_CACHE.pop(dead, None)
+        return payload
 
     def get_my_team(self) -> TeamState:
         fields = "*,lineup(type,captain,playersID),players(id,owner),balance"
@@ -430,36 +530,35 @@ class BiwengerClient:
         standings = self.get_standings()
         me = self.team_id
 
-        def _fetch(uid: int, name: str) -> tuple[int, str, list[dict]]:
-            data = self._request(
-                "GET",
-                f"{API_BASE}/user/{uid}",
-                params={"fields": "players(id,owner)"},
-            )["data"]
-            return uid, name, data.get("players") or []
-
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            futs = [pool.submit(_fetch, s.team_id, s.name) for s in standings]
-            for fut in as_completed(futs):
-                uid, name, players = fut.result()
-                for raw in players:
-                    player = catalog.get(int(raw["id"]))
-                    if not player:
-                        continue
-                    owner = raw.get("owner") or {}
-                    if "loan" in owner:
-                        player.on_loan = True
-                        loan_user = (owner.get("loan") or {}).get("user") or {}
-                        player.owner_id = loan_user.get("id") or uid
-                        player.owner_name = loan_user.get("name") or name
-                        if owner.get("price") is not None:
-                            player.buy_price = owner.get("price")
-                        continue
-                    player.owner_id = uid
-                    player.owner_name = name
-                    player.clause = owner.get("clause")
-                    player.buy_price = owner.get("price")
-                    player.is_owned_by_me = me is not None and uid == me
+        for s in standings:
+            try:
+                data = self._request(
+                    "GET",
+                    f"{API_BASE}/user/{s.team_id}",
+                    params={"fields": "players(id,owner)"},
+                )["data"]
+            except Exception:
+                logger.warning("no pude leer plantilla de %s", s.name)
+                continue
+            uid, name, players = s.team_id, s.name, data.get("players") or []
+            for raw in players:
+                player = catalog.get(int(raw["id"]))
+                if not player:
+                    continue
+                owner = raw.get("owner") or {}
+                if "loan" in owner:
+                    player.on_loan = True
+                    loan_user = (owner.get("loan") or {}).get("user") or {}
+                    player.owner_id = loan_user.get("id") or uid
+                    player.owner_name = loan_user.get("name") or name
+                    if owner.get("price") is not None:
+                        player.buy_price = owner.get("price")
+                    continue
+                player.owner_id = uid
+                player.owner_name = name
+                player.clause = owner.get("clause")
+                player.buy_price = owner.get("price")
+                player.is_owned_by_me = me is not None and uid == me
         return catalog
 
     def pay_clause(self, player_id: int, amount: int, owner_id: int | None = None) -> dict | None:
