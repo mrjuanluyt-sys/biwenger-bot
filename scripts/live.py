@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -83,23 +84,51 @@ def main() -> int:
         return 1
     client = BiwengerClient()
     client.login()
-    if not state.get("live_hello"):
+    if not state.get("live_hello_v2"):
         mode = "simulación" if settings.dry_run else "LIVE"
         tg.send_message(
-            "⚡ <b>Respuesta al instante</b>\n"
+            "⚡ <b>En directo ahora</b>\n"
             "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            "Ya no esperas 5 min. Escucho Telegram en continuo.\n"
+            "Escríbeme y te contesto al momento.\n"
             f"Modo: <b>{mode}</b>\n"
-            "Dime «ventaja» o pulsa un botón."
+            "Prueba: «ventaja» o /equipo"
         )
-        state.set_value("live_hello", True)
+        state.set_value("live_hello_v2", True)
         persist_remote()
 
     deadline = time.time() + RUN_SECONDS
     offset: int | None = None
-    last_jobs = 0.0
-    last_persist = time.time()
-    last_login = time.time()
+    stop = threading.Event()
+
+    def background() -> None:
+        jobs = BiwengerClient()
+        try:
+            jobs.login()
+        except Exception:
+            log.exception("jobs login")
+            jobs = client
+        last_login = time.time()
+        while not stop.is_set() and time.time() < deadline:
+            if time.time() - last_login > RELOGIN_EVERY:
+                try:
+                    jobs.login()
+                except Exception:
+                    log.exception("relogin")
+                last_login = time.time()
+            try:
+                from biwenger.converse import gather
+
+                gather(jobs, force=True)
+            except Exception:
+                log.exception("warm cache")
+            try:
+                run_jobs(jobs)
+            except Exception:
+                log.exception("jobs")
+            persist_remote()
+            stop.wait(JOBS_EVERY)
+
+    threading.Thread(target=background, name="jobs", daemon=True).start()
     log.info("escuchando hasta %s", datetime.fromtimestamp(deadline, TZ).isoformat())
 
     while time.time() < deadline:
@@ -107,7 +136,7 @@ def main() -> int:
             updates = tg.get_updates(offset, timeout=25)
         except requests.RequestException as exc:
             log.warning("getUpdates: %s", exc)
-            time.sleep(3)
+            time.sleep(2)
             continue
         for upd in updates:
             offset = int(upd["update_id"]) + 1
@@ -115,23 +144,8 @@ def main() -> int:
                 tg._dispatch(upd, client)
             except Exception:
                 log.exception("update")
-        now = time.time()
-        if now - last_login > RELOGIN_EVERY:
-            try:
-                client.login()
-            except Exception:
-                log.exception("relogin")
-            last_login = now
-        if now - last_jobs > JOBS_EVERY:
-            try:
-                run_jobs(client)
-            except Exception:
-                log.exception("jobs")
-            last_jobs = now
-        if now - last_persist > PERSIST_EVERY:
-            persist_remote()
-            last_persist = now
 
+    stop.set()
     persist_remote()
     log.info("fin de turno")
     return 0

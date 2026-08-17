@@ -100,6 +100,20 @@ def _keyboard(buttons: list[tuple[str, str]] | None) -> dict | None:
     return {"inline_keyboard": rows}
 
 
+def send_chat_action(action: str = "typing", chat_id: str | None = None) -> None:
+    target = chat_id or settings.telegram_chat_id
+    if not settings.telegram_bot_token or not target:
+        return
+    try:
+        requests.post(
+            f"{_base()}/sendChatAction",
+            json={"chat_id": target, "action": action},
+            timeout=5,
+        )
+    except requests.RequestException:
+        pass
+
+
 def send_message(text: str, buttons: list[tuple[str, str]] | None = None, chat_id: str | None = None) -> None:
     if not settings.telegram_bot_token:
         logger.info("Telegram no configurado:\n%s", text)
@@ -387,6 +401,7 @@ def _dispatch(upd: dict, client: BiwengerClient) -> None:
             logger.info("Chat autorizado automáticamente: %s", chat_id)
         if not allowed(chat_id):
             return
+        send_chat_action("typing", str(chat_id))
         text = msg.get("text") or ""
         if not text.startswith("/"):
             from biwenger.converse import handle_chat
@@ -406,5 +421,7 @@ def _dispatch(upd: dict, client: BiwengerClient) -> None:
             return
         data = cb.get("data") or ""
         answer_callback(cb["id"])
+        if chat_id:
+            send_chat_action("typing", str(chat_id))
         reply, buttons = handle_callback(data, client)
         send_message(reply, buttons)
