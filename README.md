@@ -98,14 +98,15 @@ No está afiliado a Biwenger ni a Diario AS.
 
 ## 24/7 gratis (GitHub Actions)
 
-El PC no hace falta. Cada 5 minutos GitHub corre `scripts/tick.py`: lee Telegram, dispara pujas al cierre y el briefing diario.
+El cron de GitHub no puede ir más rápido que cada 5 minutos. Para responder al instante el workflow `biwenger-live` deja un runner escuchando Telegram (~5 h 40 min) y se relanza solo.
 
-1. Repo **privado** (el token de Biwenger no puede ser público).
-2. Secrets en *Settings → Secrets and variables → Actions* (los mismos nombres que en `.env`).
-3. Actions → *biwenger-tick* → *Run workflow* la primera vez.
-4. **No** dejes `python main.py` a la vez: Telegram solo admite un `getUpdates`.
+Eso solo es gratis las 24 h si el repo es **público** (minutos de Actions ilimitados). Los *secrets* (token Biwenger, Telegram) no se publican. El código sí se ve.
 
-Respuesta en el chat: como mucho 5 minutos. Sigue en `DRY_RUN` hasta que digas lo contrario.
+1. Secrets en *Settings → Secrets and variables → Actions*.
+2. Actions → *biwenger-live* → *Run workflow*.
+3. **No** arranques `python main.py` a la vez.
+
+Sigue en `DRY_RUN` hasta que digas lo contrario.
 
 ## Tests
 

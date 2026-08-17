@@ -1,20 +1,22 @@
-name: biwenger-tick
+name: biwenger-live
 
-# Reserva: un ciclo suelto. El 24/7 real es biwenger-live (escucha continua).
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 */5 * * *"
 
 concurrency:
-  group: biwenger-tick
+  group: biwenger-live
   cancel-in-progress: false
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
-  tick:
+  live:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +33,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: python scripts/tick.py
+      - run: python scripts/live.py
         env:
           BIWENGER_TOKEN: ${{ secrets.BIWENGER_TOKEN }}
           BIWENGER_LEAGUE_ID: ${{ secrets.BIWENGER_LEAGUE_ID }}
@@ -44,13 +46,12 @@ jobs:
           BUDGET_SAFETY_MARGIN: ${{ secrets.BUDGET_SAFETY_MARGIN }}
           DAILY_BRIEFING_HOUR: ${{ secrets.DAILY_BRIEFING_HOUR }}
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Persist state
         if: always()
         run: |
           test -f data/state.json || exit 0
-          git config user.name "biwenger-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           work=$(mktemp -d)
           cp data/state.json "$work/state.json"
           git -C "$work" init -q
@@ -61,3 +62,15 @@ jobs:
           git -C "$work" push -fq "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" bot-state:bot-state
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Chain next
+        if: always()
+        run: |
+          queued=$(gh run list --workflow biwenger-live --status queued --json databaseId --jq 'length')
+          if [ "$queued" != "0" ]; then
+            echo "ya hay uno en cola"
+            exit 0
+          fi
+          gh workflow run biwenger-live
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
