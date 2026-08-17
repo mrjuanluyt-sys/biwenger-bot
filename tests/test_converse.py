@@ -1,4 +1,11 @@
-from biwenger.converse import detect_intent, detect_position, fold, match_manager, match_player
+from biwenger.converse import (
+    detect_intent,
+    detect_position,
+    fold,
+    match_manager,
+    match_player,
+    match_players,
+)
 from biwenger.models import ManagerBudget, Player, Position
 
 
@@ -14,6 +21,9 @@ def test_detect_intent_spanish() -> None:
     assert detect_intent("hola tío") == "greet"
     assert detect_intent("quién está lesionado") == "intel"
     assert detect_intent("pújame al cierre por Mariano") == "snipe"
+    assert detect_intent("Pedri o Nico") == "compare"
+    assert detect_intent("quién me puede clavar") == "threat"
+    assert detect_intent("vigila a Pedri") == "watch"
 
 
 def test_detect_position_from_sentence() -> None:
@@ -29,6 +39,8 @@ def test_match_player_by_surname() -> None:
     }
     assert match_player("puedo clavar a Tenaglia?", catalog).id == 2
     assert match_player("qué te parece Barrios", catalog).id == 1
+    both = match_players("Barrios o Tenaglia", catalog)
+    assert {p.id for p in both} == {1, 2}
 
 
 def test_match_manager_ignores_short_tokens() -> None:

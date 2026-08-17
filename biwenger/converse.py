@@ -3,26 +3,21 @@ from __future__ import annotations
 
 import logging
 import re
-import time
 import unicodedata
-from dataclasses import dataclass, field
 
-from . import state
-from .budget import SEASON_START, START_MONEY, build_budgets, last_reset_epoch, parse_moves
+from . import alerts, state
 from .client import BiwengerClient
 from .explain import POS_PLURAL, POS_WORD, _intel_phrase, explain_target
-from .lineup import LineupResult, best_lineup
-from .market import Target, filter_position, find_targets, money, pick_board, sell_candidates
-from .models import ManagerBudget, Player, Position, TeamState
+from .market import filter_position, money, pick_board, sell_candidates
+from .models import ManagerBudget, Player, Position
 from .predictor import predict
-from .services import _fill_buy_prices, _target_button, parse_position
+from .services import _target_button, parse_position
 from .settings import settings
+from .snap import Snap, gather
 
 logger = logging.getLogger(__name__)
 
 Button = tuple[str, str]
-_CACHE: tuple[float, "Snap"] | None = None
-CACHE_TTL = 120.0
 STOP = {
     "el", "la", "los", "las", "un", "una", "de", "del", "al", "a", "y", "o",
     "que", "es", "en", "mi", "mis", "tu", "me", "te", "se", "lo", "le", "por",
@@ -33,70 +28,6 @@ STOP = {
 def fold(text: str) -> str:
     nfkd = unicodedata.normalize("NFD", text or "")
     return "".join(c for c in nfkd.lower() if unicodedata.category(c) != "Mn")
-
-
-@dataclass
-class Snap:
-    team: TeamState
-    squad: list[Player]
-    catalog: dict[int, Player]
-    balance: int
-    max_bid: int
-    targets: list[Target]
-    budgets: list[ManagerBudget]
-    lineup: LineupResult
-    ts: float = field(default_factory=time.time)
-
-
-def gather(client: BiwengerClient, force: bool = False) -> Snap:
-    global _CACHE
-    now = time.time()
-    if not force and _CACHE and now - _CACHE[0] < CACHE_TTL:
-        return _CACHE[1]
-    team, squad, catalog = client.enrich_my_squad()
-    client.attach_league_owners(catalog)
-    from .intel import enrich_catalog
-
-    enrich_catalog(client, catalog)
-    from .edge import apply_next_home, apply_ownership
-
-    n_mgr = max(len({p.owner_id for p in catalog.values() if p.owner_id}), 1)
-    apply_ownership(catalog, n_mgr)
-    try:
-        apply_next_home(catalog, client.get_team_fixtures(5))
-    except Exception:
-        pass
-    listings, balance, max_bid = client.get_market()
-    spendable = min(balance, max_bid) if max_bid else balance
-    targets = find_targets(listings, catalog, squad, spendable)
-    standings = client.get_standings()
-    news = client.get_season_news(SEASON_START, max_pages=16)
-    moves = parse_moves(news, since=last_reset_epoch(news) or SEASON_START)
-    _fill_buy_prices(list(catalog.values()), moves)
-    league_settings = client.get_league_settings()
-    budgets, _ = build_budgets(
-        standings,
-        moves,
-        my_id=client.team_id,
-        my_balance=team.balance,
-        bonus_per_point=int(league_settings.get("bonusPoint") or 25_000),
-        max_bid_rule=str(league_settings.get("maximumBid") or "quarterTeam"),
-        start_money=START_MONEY,
-        players=list(catalog.values()),
-        listings=listings,
-    )
-    snap = Snap(
-        team=team,
-        squad=squad,
-        catalog=catalog,
-        balance=balance,
-        max_bid=max_bid,
-        targets=targets,
-        budgets=budgets,
-        lineup=best_lineup(squad),
-    )
-    _CACHE = (now, snap)
-    return snap
 
 
 def detect_position(text: str) -> Position | None:
@@ -110,25 +41,47 @@ def detect_position(text: str) -> Position | None:
     return None
 
 
+def _player_hits(text_folded: str, player: Player) -> int:
+    name = fold(player.name)
+    if len(name) < 4:
+        return 0
+    if name in text_folded:
+        return len(name) + 5
+    parts = [p for p in name.split() if len(p) >= 4]
+    hits = [p for p in parts if p in text_folded]
+    if hits and (len(hits) == len(parts) or any(len(p) >= 5 for p in hits)):
+        return sum(len(p) for p in hits)
+    return 0
+
+
 def match_player(text: str, catalog: dict[int, Player]) -> Player | None:
     folded = fold(text)
     best: tuple[int, Player] | None = None
     for player in catalog.values():
-        name = fold(player.name)
-        if len(name) < 4:
-            continue
-        if name in folded:
-            score = len(name) + 5
-            if best is None or score > best[0]:
-                best = (score, player)
-            continue
-        parts = [p for p in name.split() if len(p) >= 4]
-        hits = [p for p in parts if p in folded]
-        if hits and (len(hits) == len(parts) or any(len(p) >= 5 for p in hits)):
-            score = sum(len(p) for p in hits)
-            if best is None or score > best[0]:
-                best = (score, player)
+        score = _player_hits(folded, player)
+        if score and (best is None or score > best[0]):
+            best = (score, player)
     return best[1] if best else None
+
+
+def match_players(text: str, catalog: dict[int, Player], limit: int = 3) -> list[Player]:
+    folded = fold(text)
+    ranked: list[tuple[int, Player]] = []
+    for player in catalog.values():
+        score = _player_hits(folded, player)
+        if score:
+            ranked.append((score, player))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    out: list[Player] = []
+    seen: set[int] = set()
+    for _score, player in ranked:
+        if player.id in seen:
+            continue
+        seen.add(player.id)
+        out.append(player)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def match_manager(text: str, budgets: list[ManagerBudget]) -> ManagerBudget | None:
@@ -155,6 +108,14 @@ def detect_intent(text: str) -> str:
     q = fold(text)
     if re.search(r"\b(hola|buenas|hey|que tal|buenos dias|buenas tardes)\b", q):
         return "greet"
+    if re.search(r"\b(compar|versus|\bvs\b|mejor que|o a )\b", q) or re.search(r"\b\w+\s+o\s+\w+", q):
+        return "compare"
+    if re.search(r"(quien me (puede )?clavar|me (pueden )?clavar|proteger|escudo|me clavan)", q):
+        return "threat"
+    if re.search(r"\b(vigila|avisame|avisame de|alerta de|watch)\b", q):
+        return "watch"
+    if re.search(r"\b(alertas|avisos)\b", q):
+        return "alerts"
     if re.search(r"\b(alineacion|alineación|once|titulares|capitan|capitán)\b", q):
         return "lineup"
     if re.search(r"\b(calendario|proximo rival|próximo rival|partidos)\b", q):
@@ -224,11 +185,107 @@ def _advice_player(player: Player, snap: Snap) -> tuple[str, list[Button] | None
         lines.append(f"Esperamos {xp:.1f} puntos.")
         if lack > 0:
             lines.append(f"Ahora mismo te faltan {money(lack)} para clavarlo.")
+            for tip in sell_candidates(snap.squad, limit=8):
+                if tip.player.id == player.id:
+                    continue
+                if tip.suggested_price >= lack:
+                    lines.append(
+                        f"Si vendes a {tip.player.name} (~{money(tip.suggested_price)}) te llega. "
+                        f"{tip.reason}."
+                    )
+                    buttons.append(
+                        (f"Vender {tip.player.name} {money(tip.suggested_price)}", f"sell:{tip.player.id}:{tip.suggested_price}")
+                    )
+                    break
         else:
             lines.append("Sí podrías pagar la cláusula.")
             buttons.append((f"Cláusula {player.name} {money(player.clause)}", f"askclause:{player.id}:{player.clause}"))
         return "\n".join(lines), buttons or None
     lines.append(f"Vale {money(player.price)}. Esperamos {xp:.1f} puntos. No está a la venta ni tiene cláusula a tiro.")
+    return "\n".join(lines), None
+
+
+def _compare(a: Player, b: Player, snap: Snap) -> tuple[str, list[Button] | None]:
+    _remember(player_id=a.id)
+    xa, xb = predict(a), predict(b)
+    lines = [
+        f"⚖️ <b>{a.name} vs {b.name}</b>",
+        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+        f"{a.status_emoji} {a.name}: {xa:.1f} pts · {money(a.price)}"
+        + (f" · cláusula {money(a.clause)}" if a.clause else "")
+        + (f" · de {a.owner_name}" if a.owner_name and not a.is_owned_by_me else "")
+        + (" · TÚ" if a.is_owned_by_me or any(p.id == a.id for p in snap.squad) else ""),
+        f"{b.status_emoji} {b.name}: {xb:.1f} pts · {money(b.price)}"
+        + (f" · cláusula {money(b.clause)}" if b.clause else "")
+        + (f" · de {b.owner_name}" if b.owner_name and not b.is_owned_by_me else "")
+        + (" · TÚ" if b.is_owned_by_me or any(p.id == b.id for p in snap.squad) else ""),
+        "",
+    ]
+    winner = a if xa > xb else b
+    gap = abs(xa - xb)
+    if gap < 0.25:
+        lines.append("Están muy parejos. Quédate con el más barato o el que menos gente tenga.")
+    else:
+        lines.append(f"Para el once, yo me quedo con {winner.name} ({gap:.1f} pts más).")
+    if a.position == b.position:
+        best = max(
+            (predict(p) for p in snap.squad if p.position == a.position and not p.is_injured_or_suspended),
+            default=0.0,
+        )
+        for p, xp in ((a, xa), (b, xb)):
+            if xp > best + 0.4 and not any(s.id == p.id for s in snap.squad):
+                lines.append(f"{p.name} mejoraría tu {a.position.label} actual ({best:.1f} pts).")
+    buttons: list[Button] = []
+    for p in (a, b):
+        t = next((x for x in snap.targets if x.player.id == p.id), None)
+        if t:
+            btn = _target_button(t)
+            if btn:
+                buttons.append(btn)
+    return "\n".join(lines), buttons or None
+
+
+def _threats(snap: Snap) -> tuple[str, list[Button] | None]:
+    lines = [
+        "🛡️ <b>Quién te puede clavar</b>",
+        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+    ]
+    buttons: list[Button] = []
+    hits = 0
+    for p in sorted(snap.squad, key=lambda x: predict(x), reverse=True):
+        if not p.clause:
+            continue
+        hunters = alerts.clause_hunters(snap, int(p.clause))
+        if not hunters:
+            continue
+        hits += 1
+        lines.append(f"{p.status_emoji} {p.name} · cláusula {money(p.clause)}")
+        lines.append("   lo pagan: " + ", ".join(hunters[:5]))
+        if predict(p) >= 3.5:
+            price = max(int(round(p.price * 0.98 / 1000) * 1000), 1)
+            buttons.append((f"Vender {p.name} {money(price)}", f"sell:{p.id}:{price}"))
+    if not hits:
+        lines.append("Nadie de la liga te llega a las cláusulas de tus jugadores útiles.")
+    return "\n".join(lines), buttons or None
+
+
+def _watch_answer(player: Player | None, snap: Snap) -> tuple[str, list[Button] | None]:
+    if player:
+        added = alerts.watch_add(player.id)
+        _remember(player_id=player.id)
+        verb = "Empiezo a vigilar" if added else "Ya lo vigilaba"
+        return (
+            f"👀 {verb} a {player.name}.\n"
+            "Te aviso si sale al mercado o si te llega la cláusula.",
+            [("📋 Vigilados", "cmd:alertas")],
+        )
+    ids = alerts.watchlist()
+    if not ids:
+        return "No vigilo a nadie. Dime «vigila a Pedri».", None
+    lines = ["👀 <b>Vigilados</b>", "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"]
+    for pid in ids:
+        p = snap.catalog.get(pid)
+        lines.append(f"  • {p.name if p else pid}")
     return "\n".join(lines), None
 
 
@@ -369,8 +426,11 @@ def handle_chat(text: str, client: BiwengerClient) -> tuple[str, list[Button] | 
     snap = gather(client)
     intent = detect_intent(raw)
     pos = detect_position(raw)
-    player = match_player(raw, snap.catalog)
+    mentioned = match_players(raw, snap.catalog)
+    player = mentioned[0] if mentioned else None
     manager = match_manager(raw, snap.budgets)
+    if intent == "compare" and len(mentioned) < 2:
+        intent = "chat"
 
     if intent == "followup" and not player:
         last = state.get("last_player_id")
@@ -384,10 +444,18 @@ def handle_chat(text: str, client: BiwengerClient) -> tuple[str, list[Button] | 
             intent = "manager"
 
     structured: tuple[str, list[Button] | None]
-    if player and intent in {"chat", "followup", "market", "clause", "player", "sell"}:
+    if intent == "compare" and len(mentioned) >= 2:
+        structured = _compare(mentioned[0], mentioned[1], snap)
+    elif player and intent in {"chat", "followup", "market", "clause", "player", "sell"}:
         structured = _advice_player(player, snap)
     elif manager and intent in {"chat", "followup", "budget", "manager"}:
         structured = _advice_manager(manager)
+    elif intent == "threat":
+        structured = _threats(snap)
+    elif intent == "watch":
+        structured = _watch_answer(player, snap)
+    elif intent == "alerts":
+        structured = _watch_answer(None, snap)
     elif intent == "greet":
         structured = (
             "👋 <b>Dime qué quieres y lo miro</b>\n"
@@ -409,7 +477,7 @@ def handle_chat(text: str, client: BiwengerClient) -> tuple[str, list[Button] | 
     elif intent == "squad":
         from .services import squad_text
 
-        structured = (squad_text(client), None)
+        structured = (squad_text(client, snap), None)
     elif intent == "clause":
         structured = _clause_answer(snap, pos)
     elif intent == "market":
@@ -417,19 +485,19 @@ def handle_chat(text: str, client: BiwengerClient) -> tuple[str, list[Button] | 
     elif intent == "budget":
         from .services import budget_report
 
-        structured = budget_report(client)
+        structured = budget_report(client, snap)
     elif intent == "sell":
         from .services import sell_report
 
-        structured = sell_report(client)
+        structured = sell_report(client, snap)
     elif intent == "calendar":
         from .services import calendar_text
 
-        structured = (calendar_text(client), None)
+        structured = (calendar_text(client, snap), None)
     elif intent == "table":
         from .services import standings_text
 
-        structured = (standings_text(client), None)
+        structured = (standings_text(client, snap), None)
     elif intent == "snipe":
         from .services import schedule_close_bid, snipe_list_text
 
@@ -447,15 +515,15 @@ def handle_chat(text: str, client: BiwengerClient) -> tuple[str, list[Button] | 
     elif intent == "edge":
         from .services import edge_report
 
-        structured = edge_report(client)
+        structured = edge_report(client, snap)
     elif intent == "intel":
         from .services import intel_report
 
-        structured = intel_report(client)
+        structured = intel_report(client, snap)
     elif intent == "briefing":
         from .services import daily_briefing
 
-        structured = daily_briefing(client)
+        structured = daily_briefing(client, snap)
     else:
         structured = (
             "No te he pillado del todo. Prueba con un nombre (Pedri, Tenaglia), "

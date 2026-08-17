@@ -58,6 +58,8 @@ HELP = (
     "💶 /presupuesto — caja de toda la liga\n"
     "📰 /previa — AS, SofaScore, lesiones\n"
     "🎯 /pujas — auto-pujas al cierre\n"
+    "🛡️ /amenazas — quién te puede clavar\n"
+    "👀 /vigila — avísame de un jugador\n"
     "👥 /equipo  ·  ⏱️ /vender  ·  📅 /calendario\n"
     "🏆 /clasificacion  ·  📋 /resumen"
 )
@@ -76,6 +78,8 @@ MENU = [
     ("resumen", "Briefing de ahora"),
     ("auto", "Auto-alineación"),
     ("pujas", "Pujas al cierre programadas"),
+    ("amenazas", "Quién te puede clavar"),
+    ("vigila", "Vigilar un jugador"),
     ("help", "Ayuda"),
 ]
 
@@ -227,6 +231,19 @@ def handle_command(text: str, client: BiwengerClient) -> tuple[str, list[tuple[s
         return daily_briefing(client)
     if cmd in {"/pujas", "/cierre"}:
         return snipe_list_text(), None
+    if cmd in {"/amenazas", "/proteger"}:
+        from biwenger.converse import _threats
+        from biwenger.snap import gather
+
+        return _threats(gather(client))
+    if cmd in {"/vigila", "/alertas"}:
+        from biwenger.converse import _watch_answer, match_player
+        from biwenger.snap import gather
+
+        snap = gather(client)
+        rest = text.strip().split(maxsplit=1)
+        who = match_player(rest[1], snap.catalog) if len(rest) > 1 else None
+        return _watch_answer(who, snap)
     if cmd == "/auto":
         on = bool(state.get("auto_lineup"))
         text_msg = (
@@ -255,6 +272,8 @@ def handle_callback(data: str, client: BiwengerClient) -> tuple[str, list[tuple[
             "previa": "/previa",
             "resumen": "/resumen",
             "pujas": "/pujas",
+            "amenazas": "/amenazas",
+            "alertas": "/alertas",
         }
         key = data.split(":", 1)[1]
         return handle_command(mapping.get(key, "/help"), client)

@@ -33,8 +33,17 @@ from .market import Target, filter_position, find_targets, money, pick_board, se
 from .models import Player, Position, TeamState
 from .predictor import predict
 from .settings import settings
+from .snap import Snap, fill_buy_prices, gather
 
 Button = tuple[str, str]
+
+
+def _fill_buy_prices(players: list[Player], moves) -> None:
+    fill_buy_prices(players, moves)
+
+
+def _snap(client: BiwengerClient, snap: Snap | None = None) -> Snap:
+    return snap or gather(client)
 
 
 def _mode_tag() -> str:
@@ -75,27 +84,19 @@ def lineup_buttons() -> list[Button]:
     return [("✅ Aplicar esta alineación", "apply:lineup")]
 
 
-def build_lineup(client: BiwengerClient) -> tuple[str, list[Button], LineupResult]:
-    team, squad, catalog = client.enrich_my_squad()
-    client.attach_league_owners(catalog)
-    enrich_catalog(client, catalog)
-    n_mgr = max(len({p.owner_id for p in catalog.values() if p.owner_id}), 1)
-    apply_ownership(catalog, n_mgr)
-    try:
-        apply_next_home(catalog, client.get_team_fixtures(5))
-    except Exception:
-        pass
-    result = best_lineup(squad)
-    cap = pick_captain(result, n_mgr)
+def build_lineup(client: BiwengerClient, snap: Snap | None = None) -> tuple[str, list[Button], LineupResult]:
+    snap = _snap(client, snap)
+    result = snap.lineup
+    cap = pick_captain(result, snap.n_managers)
     if cap:
         result.captain = cap
     buttons = [] if result.formation.startswith("incompleto") else lineup_buttons()
-    return lineup_text(result, team), buttons, result
+    return lineup_text(result, snap.team), buttons, result
 
 
-def squad_text(client: BiwengerClient) -> str:
-    team, squad, catalog = client.enrich_my_squad()
-    enrich_catalog(client, catalog)
+def squad_text(client: BiwengerClient, snap: Snap | None = None) -> str:
+    snap = _snap(client, snap)
+    team, squad = snap.team, snap.squad
     lines = [
         f"👥 {team.name}  ·  {money(team.balance)}  ·  {team.points} pts  ·  {_mode_tag()}",
         f"{len(squad)} jugadores",
@@ -165,28 +166,19 @@ def _close_bid_button(t: Target) -> Button | None:
     return (f"Al cierre si vacío {t.player.name}", f"snipe:{t.player.id}:{amount}")
 
 
-def _collect_targets(client: BiwengerClient, clause_only: bool = False) -> tuple[list[Target], int, int, dict[int, Player]]:
-    _team, squad, catalog = client.enrich_my_squad()
-    client.attach_league_owners(catalog)
-    enrich_catalog(client, catalog)
-    apply_ownership(catalog, max(len({p.owner_id for p in catalog.values() if p.owner_id}), 1))
-    try:
-        apply_next_home(catalog, client.get_team_fixtures(5))
-    except Exception:
-        pass
-    listings, balance, max_bid = client.get_market()
-    if clause_only:
-        spendable = max(balance - settings.budget_safety_margin, 0)
-    else:
-        spendable = min(balance, max_bid) if max_bid else balance
-    targets = find_targets(listings, catalog, squad, spendable)
+def _collect_targets(
+    client: BiwengerClient, clause_only: bool = False, snap: Snap | None = None
+) -> tuple[list[Target], int, int, dict[int, Player]]:
+    snap = _snap(client, snap)
+    targets = snap.targets
     if clause_only:
         targets = [t for t in targets if t.source == "clause"]
-    return targets, balance, max_bid, catalog
+    return targets, snap.balance, snap.max_bid, snap.catalog
 
 
-def market_report(client: BiwengerClient, clause_only: bool = False) -> tuple[str, list[Button]]:
-    targets, balance, max_bid, catalog = _collect_targets(client, clause_only=clause_only)
+def market_report(client: BiwengerClient, clause_only: bool = False, snap: Snap | None = None) -> tuple[str, list[Button]]:
+    snap = _snap(client, snap)
+    targets, balance, max_bid, catalog = _collect_targets(client, clause_only=clause_only, snap=snap)
     board, watch = pick_board(targets, affordable_n=4, watch_n=2)
     n_clause = sum(1 for t in targets if t.source == "clause")
     n_mkt = sum(1 for t in targets if t.source != "clause")
@@ -211,7 +203,7 @@ def market_report(client: BiwengerClient, clause_only: bool = False) -> tuple[st
         lines.append("")
         for t in watch:
             lines.extend(explain_target(t, balance))
-    offers = client.get_offers()
+    offers = snap.offers
     if offers and not clause_only:
         lines.append("📥 Ofertas que te han hecho")
         for off in offers:
@@ -244,8 +236,8 @@ def clause_menu() -> tuple[str, list[Button]]:
     return text, buttons
 
 
-def clause_report(client: BiwengerClient, position: Position | None = None) -> tuple[str, list[Button]]:
-    targets, balance, _max_bid, _catalog = _collect_targets(client, clause_only=True)
+def clause_report(client: BiwengerClient, position: Position | None = None, snap: Snap | None = None) -> tuple[str, list[Button]]:
+    targets, balance, _max_bid, _catalog = _collect_targets(client, clause_only=True, snap=snap)
     targets = filter_position(targets, position)
     board, watch = pick_board(targets, affordable_n=4, watch_n=2)
     lines = [f"{_mode_tag()}", ""]
@@ -286,31 +278,13 @@ def _fill_buy_prices(players: list[Player], moves) -> None:
             player.buy_price = last_pay.get((int(player.owner_id), int(player.id)))
 
 
-def budget_report(client: BiwengerClient) -> tuple[str, list[Button]]:
-    team, squad, catalog = client.enrich_my_squad()
-    client.attach_league_owners(catalog)
-    listings, _balance, my_max_bid = client.get_market()
-    standings = client.get_standings()
-    settings_league = client.get_league_settings()
-    news = client.get_season_news(SEASON_START, max_pages=16)
-    since = last_reset_epoch(news) or SEASON_START
-    moves = parse_moves(news, since=since)
-    _fill_buy_prices(list(catalog.values()), moves)
-    bonus = int(settings_league.get("bonusPoint") or 25_000)
-    rule = str(settings_league.get("maximumBid") or "quarterTeam")
-    budgets, start = build_budgets(
-        standings,
-        moves,
-        my_id=client.team_id,
-        my_balance=team.balance,
-        bonus_per_point=bonus,
-        max_bid_rule=rule,
-        start_money=START_MONEY,
-        players=list(catalog.values()),
-        listings=listings,
-    )
+def budget_report(client: BiwengerClient, snap: Snap | None = None) -> tuple[str, list[Button]]:
+    snap = _snap(client, snap)
+    team = snap.team
+    budgets = snap.budgets
+    my_max_bid = snap.max_bid
     prev = load_previous_cash()
-    save_snapshot(budgets, start)
+    save_snapshot(budgets, START_MONEY)
 
     mine = next((b for b in budgets if b.is_me), None)
     recon_ok = mine is not None and abs(mine.cash_raw - team.balance) <= 1
@@ -382,8 +356,9 @@ def budget_report(client: BiwengerClient) -> tuple[str, list[Button]]:
     return "\n".join(lines).strip(), [("🔓 Buscar cláusulas", "cmd:clausulas")]
 
 
-def intel_report(client: BiwengerClient) -> tuple[str, list[Button]]:
-    team, squad, catalog = client.enrich_my_squad()
+def intel_report(client: BiwengerClient, snap: Snap | None = None) -> tuple[str, list[Button]]:
+    snap = _snap(client, snap)
+    team, squad, catalog = snap.team, snap.squad, snap.catalog
     intel = enrich_catalog(client, catalog)
     lines = [
         "📰 <b>PREVIA · AS + SofaScore</b>",
@@ -437,10 +412,9 @@ def intel_report(client: BiwengerClient) -> tuple[str, list[Button]]:
     ]
 
 
-def sell_report(client: BiwengerClient) -> tuple[str, list[Button]]:
-    _, squad, catalog = client.enrich_my_squad()
-    enrich_catalog(client, catalog)
-    tips = sell_candidates(squad)
+def sell_report(client: BiwengerClient, snap: Snap | None = None) -> tuple[str, list[Button]]:
+    snap = _snap(client, snap)
+    tips = sell_candidates(snap.squad)
     if not tips:
         return "⏱️ Nadie urgente de vender. Plantilla estable.", []
     lines = [f"⏱️ Candidatos a vender  ·  {_mode_tag()}", ""]
@@ -454,42 +428,19 @@ def sell_report(client: BiwengerClient) -> tuple[str, list[Button]]:
     return "\n".join(lines).strip(), buttons
 
 
-def edge_report(client: BiwengerClient) -> tuple[str, list[Button]]:
-    team, squad, catalog = client.enrich_my_squad()
-    client.attach_league_owners(catalog)
-    enrich_catalog(client, catalog)
-    owners = {p.owner_id for p in catalog.values() if p.owner_id}
-    n_mgr = max(len(owners), 1)
-    apply_ownership(catalog, n_mgr)
-    fixtures: dict = {}
-    try:
-        fixtures = client.get_team_fixtures(5)
-        apply_next_home(catalog, fixtures)
-    except Exception:
-        pass
-    listings, balance, max_bid = client.get_market()
+def edge_report(client: BiwengerClient, snap: Snap | None = None) -> tuple[str, list[Button]]:
+    snap = _snap(client, snap)
+    team, squad, catalog = snap.team, snap.squad, snap.catalog
+    n_mgr = snap.n_managers
+    fixtures = snap.fixtures
+    balance, max_bid = snap.balance, snap.max_bid
     spendable = min(balance, max_bid) if max_bid else balance
-    targets = find_targets(listings, catalog, squad, spendable)
-    result = best_lineup(squad)
+    targets = snap.targets
+    result = snap.lineup
     cap = pick_captain(result, n_mgr)
     if cap:
         result.captain = cap
-
-    standings = client.get_standings()
-    news = client.get_season_news(SEASON_START, max_pages=12)
-    moves = parse_moves(news, since=last_reset_epoch(news) or SEASON_START)
-    league_settings = client.get_league_settings()
-    budgets, _ = build_budgets(
-        standings,
-        moves,
-        my_id=client.team_id,
-        my_balance=team.balance,
-        bonus_per_point=int(league_settings.get("bonusPoint") or 25_000),
-        max_bid_rule=str(league_settings.get("maximumBid") or "quarterTeam"),
-        start_money=START_MONEY,
-        players=list(catalog.values()),
-        listings=listings,
-    )
+    budgets = snap.budgets
 
     lines = [
         "⚡ <b>VENTAJA DE HOY</b>",
@@ -584,15 +535,54 @@ def edge_report(client: BiwengerClient) -> tuple[str, list[Button]]:
             lines.append(f"   → {row}")
         lines.append("")
 
+    from .alerts import clause_hunters
+
+    hunters_lines: list[str] = []
+    for p in sorted(squad, key=lambda x: predict(x), reverse=True)[:8]:
+        if not p.clause:
+            continue
+        names = clause_hunters(snap, int(p.clause))
+        if names:
+            hunters_lines.append(f"   → {p.name} ({money(p.clause)}): {', '.join(names[:3])}")
+    lines.append("8) Quién te puede clavar ahora (caja real/estimada)")
+    if hunters_lines:
+        lines.extend(hunters_lines[:4])
+    else:
+        lines.append("   Nadie te llega a las cláusulas de tus útiles.")
+    lines.append("")
+
+    leader = min((b for b in budgets if not b.is_me), key=lambda b: b.position, default=None)
+    if leader:
+        from_leader = [
+            t
+            for t in targets
+            if t.source == "clause" and t.player.owner_id == leader.team_id and t.extra_xp > 0.4
+        ]
+        lines.append(f"9) Pega al líder ({leader.name}, {leader.position}º)")
+        if from_leader:
+            t = from_leader[0]
+            tag = "te llega" if t.affordable else "ahorra"
+            lines.append(
+                f"   → {t.player.name} {money(t.cost)} · {t.extra_xp:+.1f} XI · {tag}"
+            )
+            btn = _target_button(t)
+            if btn:
+                buttons.append(btn)
+        else:
+            lines.append("   No veo un clausulazo suyo que te mejore hoy.")
+        lines.append("")
+
     lines.append("Esto es lo que gana ligas: tapar el hueco, pillar lo que nadie tiene, capitán diferencial.")
     buttons.append(("🔓 Cláusulas", "cmd:clausulas"))
     buttons.append(("💶 Cajas rivales", "cmd:presupuesto"))
+    buttons.append(("🛡️ Quién me clava", "cmd:amenazas"))
     return "\n".join(lines).strip(), buttons
 
 
-def calendar_text(client: BiwengerClient) -> str:
-    _, squad, _ = client.enrich_my_squad()
-    fixtures = client.get_team_fixtures(5)
+def calendar_text(client: BiwengerClient, snap: Snap | None = None) -> str:
+    snap = _snap(client, snap)
+    squad = snap.squad
+    fixtures = snap.fixtures or client.get_team_fixtures(5)
     teams: dict[int, list[Player]] = {}
     for p in squad:
         if p.team_id:
@@ -616,26 +606,30 @@ def calendar_text(client: BiwengerClient) -> str:
     return "\n".join(lines).strip()
 
 
-def standings_text(client: BiwengerClient) -> str:
+def standings_text(client: BiwengerClient, snap: Snap | None = None) -> str:
+    lines = ["🏆 Clasificación", ""]
+    if snap is not None:
+        me = snap.team.team_id
+        for b in sorted(snap.budgets, key=lambda x: x.position):
+            mark = " ← tú" if me and b.team_id == me else ""
+            lines.append(f"{b.position:>2}. {b.name}  {b.points} pts{mark}")
+        return "\n".join(lines)
     rows = client.get_standings()
     me = client.team_id
-    lines = ["🏆 Clasificación", ""]
     for row in rows:
         mark = " ← tú" if me and row.team_id == me else ""
         lines.append(f"{row.position:>2}. {row.name}  {row.points} pts{mark}")
     return "\n".join(lines)
 
 
-def daily_briefing(client: BiwengerClient) -> tuple[str, list[Button]]:
-    team, squad, catalog = client.enrich_my_squad()
-    client.attach_league_owners(catalog)
-    enrich_catalog(client, catalog)
-    result = best_lineup(squad)
-    listings, balance, max_bid = client.get_market()
-    spendable = min(balance, max_bid or balance)
-    board, _watch = pick_board(find_targets(listings, catalog, squad, spendable), affordable_n=4, watch_n=0)
+def daily_briefing(client: BiwengerClient, snap: Snap | None = None) -> tuple[str, list[Button]]:
+    snap = _snap(client, snap)
+    team, squad = snap.team, snap.squad
+    result = snap.lineup
+    balance = snap.balance
+    board, _watch = pick_board(snap.targets, affordable_n=4, watch_n=0)
     tips = sell_candidates(squad, limit=3)
-    offers = client.get_offers()
+    offers = snap.offers
 
     lines = [
         f"📋 Resumen diario  ·  {_mode_tag()}",

@@ -116,11 +116,15 @@ def main() -> int:
                     log.exception("relogin")
                 last_login = time.time()
             try:
-                from biwenger.converse import gather
+                from biwenger.alerts import scan
+                from biwenger.snap import gather
 
-                gather(jobs, force=True)
+                snap = gather(jobs, force=True)
+                for note, buttons in scan(snap):
+                    tg.send_message(note, buttons)
+                    log.info("alerta: %s", note.splitlines()[0][:80])
             except Exception:
-                log.exception("warm cache")
+                log.exception("warm/alertas")
             try:
                 run_jobs(jobs)
             except Exception:
