@@ -181,9 +181,16 @@ def find_targets(
     squad: list[Player],
     available: int,
     cfg: Settings | None = None,
+    clause_cash: int | None = None,
 ) -> list[Target]:
-    """Analiza TODO: mercado + ventas + cláusulas de rivales."""
+    """Analiza TODO: mercado + ventas + cláusulas de rivales.
+
+    `available` = techo de puja (caja + 25% plantilla).
+    `clause_cash` = solo caja: las cláusulas no se pagan con el techo.
+    """
     cfg = cfg or default_settings
+    market_cap = max(int(available), 0)
+    cash = market_cap if clause_cash is None else max(int(clause_cash), 0)
     owned = {p.id for p in squad}
     listed = {item.player_id: item for item in listings}
     out: list[Target] = []
@@ -196,8 +203,8 @@ def find_targets(
         if not player:
             continue
         source = "free" if listing.is_free_market else "sale"
-        bids = bid_levels(listing.price or player.price, available, cfg.budget_safety_margin)
-        target = _make_target(player, listing.price, source, squad, available, listing, bids)
+        bids = bid_levels(listing.price or player.price, market_cap, cfg.budget_safety_margin)
+        target = _make_target(player, listing.price, source, squad, market_cap, listing, bids)
         if target:
             out.append(target)
 
@@ -211,7 +218,7 @@ def find_targets(
         listing = listed.get(player.id)
         if listing and listing.price and listing.price <= player.clause:
             continue
-        target = _make_target(player, int(player.clause), "clause", squad, available)
+        target = _make_target(player, int(player.clause), "clause", squad, cash)
         if target:
             out.append(target)
 

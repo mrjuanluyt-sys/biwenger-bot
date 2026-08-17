@@ -429,153 +429,196 @@ def sell_report(client: BiwengerClient, snap: Snap | None = None) -> tuple[str, 
 
 
 def edge_report(client: BiwengerClient, snap: Snap | None = None) -> tuple[str, list[Button]]:
+    """Playbook de jornada: proyecta el XI de toda la liga y dice la jugada."""
+    from .alerts import clause_hunters
+    from .unfair import (
+        best_anti_captain,
+        broken_rivals,
+        empty_market,
+        gap_to_beat,
+        price_front_run,
+        project_league,
+        steal_from,
+    )
+
     snap = _snap(client, snap)
-    team, squad, catalog = snap.team, snap.squad, snap.catalog
-    n_mgr = snap.n_managers
-    fixtures = snap.fixtures
-    balance, max_bid = snap.balance, snap.max_bid
-    spendable = min(balance, max_bid) if max_bid else balance
-    targets = snap.targets
+    team, squad = snap.team, snap.squad
     result = snap.lineup
-    cap = pick_captain(result, n_mgr)
+    cap = best_anti_captain(snap) or pick_captain(result, snap.n_managers)
     if cap:
         result.captain = cap
-    budgets = snap.budgets
+    weeks = project_league(snap)
+    mine = next((w for w in weeks if w.is_me), None)
+    my_rank = next((i + 1 for i, w in enumerate(weeks) if w.is_me), "?")
+    table_me = next((b for b in snap.budgets if b.is_me), None)
 
     lines = [
-        "⚡ <b>VENTAJA DE HOY</b>",
+        "⚡ <b>VENTAJA INJUSTA</b>",
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-        f"🏟️ {team.name}   💶 {money(balance)}   🎯 techo {money(max_bid)}",
-        f"{_mode_tag()}",
+        f"{team.name} · {table_me.position}º en liga · {team.points} pts" if table_me else team.name,
+        f"💶 {money(max(snap.balance, 0))}"
+        + (" · caja en rojo, no pagas cláusulas" if snap.balance < 0 else "")
+        + f"   techo puja {money(snap.max_bid)}   {_mode_tag()}",
         "",
+        "<b>Proyección de ESTA jornada</b> (XI+capi de los 13, con AS/bajas)",
     ]
+    for i, w in enumerate(weeks[:8], start=1):
+        mark = " ← TÚ" if w.is_me else ""
+        cap_name = w.lineup.captain.name if w.lineup.captain else "—"
+        hole_txt = f" · SIN {w.hole.label}" if w.hole else ""
+        lines.append(
+            f"{i}. {w.name}  {w.week_pts:.1f} pts  cap {cap_name}{hole_txt}{mark}"
+        )
+    if len(weeks) > 8:
+        lines.append(f"… y {len(weeks) - 8} más")
+    lines.append("")
+
     buttons: list[Button] = []
+    gap = gap_to_beat(weeks)
+    if mine and gap:
+        rival, need = gap
+        lines.append(
+            f"<b>Jugada 1 · adelantar a {rival.name} esta semana</b>\n"
+            f"Te faltan {need:.1f} pts de proyección. Su capi es "
+            f"{rival.lineup.captain.name if rival.lineup.captain else '—'}."
+        )
+    elif mine:
+        second = next((w for w in weeks if not w.is_me), None)
+        lead = (mine.week_pts - second.week_pts) if second else 0
+        lines.append(
+            f"<b>Jugada 1 · vas 1º esta jornada</b> (+{lead:.1f} pts al siguiente). No la cagues."
+        )
+    if cap:
+        why = []
+        if cap.starter_role == "starter":
+            why.append("titular AS")
+        if cap.next_is_home:
+            why.append("casa")
+        if cap.fixture_difficulty is not None and cap.fixture_difficulty <= 40:
+            why.append(f"rival {cap.fixture_difficulty:.0f}")
+        lines.append(
+            f"Capitán: {cap.name} ({result.expected.get(cap.id, 0):.1f} x2"
+            + (f", {', '.join(why)}" if why else "")
+            + f"). Once {result.formation} · {result.total_expected:.1f} + capi."
+        )
+        if not result.formation.startswith("incompleto"):
+            buttons.append(("✅ Poner este XI + capi", "apply:lineup"))
+    lines.append("")
+
     pos_hole = hole(squad)
     if pos_hole:
         word = POS_WORD.get(pos_hole, pos_hole.label)
-        lines.append(f"1) Hueco letal: te falta {word}. Mientras no lo tapes, cada jornada regalas puntos.")
-        fills = best_targets_for_hole(targets, pos_hole)
+        lines.append(f"<b>Jugada 2 · TAPA EL {word.upper()}</b> o tiras la jornada.")
+        fills = best_targets_for_hole(snap.targets, pos_hole)
         if not fills:
-            lines.append("   No hay uno asequible hoy. No gastes el saldo en otra cosa.")
+            lines.append("No hay uno asequible. No gastes el saldo en otra línea.")
         for t in fills[:2]:
-            tag = "" if t.affordable else " · AHORRA, ahora no te llega"
+            tag = "PÁGALO" if t.affordable else "ahora no te llega"
             lines.append(
-                f"   → {t.player.name} ({t.via} {money(t.cost)}) · "
-                f"{predict(t.player):.1f} pts · {ownership_label(t.player, n_mgr)}{tag}"
+                f"→ {t.player.name} · {t.via} {money(t.cost)} · "
+                f"{t.expected:.1f} pts · {tag}"
             )
             btn = _target_button(t)
             if btn:
                 buttons.append(btn)
         lines.append("")
     else:
-        lines.append("1) Plantilla cubierta. Ahora toca mejorar, no rellenar.")
-        lines.append("")
-
-    diffs = differentials(catalog)
-    lines.append("2) Diferenciales (puntos que solo sumas tú)")
-    if diffs:
-        for p in diffs[:4]:
-            via = "cláusula" if p.clause and p.owner_id else "mercado"
-            cost = p.clause or p.price
-            lines.append(
-                f"   → {p.name} ({p.position.label}) {money(cost)} · "
-                f"{predict(p):.1f} pts · {ownership_label(p, n_mgr)}"
-            )
-            if p.clause and p.owner_id and (p.clause or 0) <= spendable:
-                buttons.append((f"Cláusula {p.name} {money(p.clause)}", f"askclause:{p.id}:{p.clause}"))
-    else:
-        lines.append("   Hoy no hay un chollo único claro.")
-    lines.append("")
-
-    if result.captain:
-        lines.append(
-            f"3) Capitán: {result.captain.name} "
-            f"({result.expected.get(result.captain.id, 0):.1f} x2, {ownership_label(result.captain, n_mgr)})"
-        )
-        if result.captain.next_is_home:
-            lines.append("   Juega en casa.")
-        lines.append(f"   Once {result.formation} · {result.total_expected:.1f} pts esperados.")
-        if not result.formation.startswith("incompleto"):
-            buttons.append(("✅ Aplicar XI + capitán", "apply:lineup"))
-        lines.append("")
-
-    risers = price_risers(catalog)
-    mine_ids = {p.id for p in squad}
-    lines.append("4) Precio: suben mañana / bajan los tuyos")
-    up = [p for p in risers if p.id not in mine_ids][:3]
-    if up:
-        lines.append("   Coge antes de que suban: " + ", ".join(f"{p.name} ({p.price_trend_pct:+.1f}%)" for p in up))
-    down = price_falls(squad)
-    if down:
-        lines.append("   Suéltanos antes de que sangren: " + ", ".join(f"{p.name} ({p.price_trend_pct:+.1f}%)" for p in down))
-    lines.append("")
-
-    wr = weak_rivals(catalog, budgets)
-    lines.append("5) Rivales tocados (ahora se les puede clavar)")
-    if wr:
-        for note in wr:
-            lines.append(f"   → {note}")
-    else:
-        lines.append("   Nadie está realmente contra las cuerdas.")
-    lines.append("")
-
-    vul = shield(squad)
-    lines.append("6) Te pueden clavar a ti")
-    if vul:
-        for p in vul:
-            lines.append(f"   → {p.name}: cláusula {money(p.clause or 0)} vs valor {money(p.price)}")
-    else:
-        lines.append("   Tus cracks no están regalados.")
-    lines.append("")
-
-    cal = calendar_edge(squad, fixtures)
-    if cal:
-        lines.append("7) Calendario (juega el fixture, no el nombre)")
-        for row in cal:
-            lines.append(f"   → {row}")
-        lines.append("")
-
-    from .alerts import clause_hunters
-
-    hunters_lines: list[str] = []
-    for p in sorted(squad, key=lambda x: predict(x), reverse=True)[:8]:
-        if not p.clause:
-            continue
-        names = clause_hunters(snap, int(p.clause))
-        if names:
-            hunters_lines.append(f"   → {p.name} ({money(p.clause)}): {', '.join(names[:3])}")
-    lines.append("8) Quién te puede clavar ahora (caja real/estimada)")
-    if hunters_lines:
-        lines.extend(hunters_lines[:4])
-    else:
-        lines.append("   Nadie te llega a las cláusulas de tus útiles.")
-    lines.append("")
-
-    leader = min((b for b in budgets if not b.is_me), key=lambda b: b.position, default=None)
-    if leader:
-        from_leader = [
-            t
-            for t in targets
-            if t.source == "clause" and t.player.owner_id == leader.team_id and t.extra_xp > 0.4
-        ]
-        lines.append(f"9) Pega al líder ({leader.name}, {leader.position}º)")
-        if from_leader:
-            t = from_leader[0]
-            tag = "te llega" if t.affordable else "ahorra"
-            lines.append(
-                f"   → {t.player.name} {money(t.cost)} · {t.extra_xp:+.1f} XI · {tag}"
-            )
-            btn = _target_button(t)
-            if btn:
-                buttons.append(btn)
+        board, _ = pick_board([t for t in snap.targets if t.extra_xp >= 0.6], affordable_n=2, watch_n=0)
+        lines.append("<b>Jugada 2 · mejora que solo sumas tú</b>")
+        if board:
+            for t in board:
+                owner = t.player.owner_name or "mercado"
+                lines.append(
+                    f"→ {t.player.name} ({owner}) · {t.via} {money(t.cost)} · "
+                    f"+{t.extra_xp:.1f} al XI · {t.expected:.1f} pts"
+                )
+                btn = _target_button(t)
+                if btn:
+                    buttons.append(btn)
+                close = _close_bid_button(t)
+                if close:
+                    buttons.append(close)
         else:
-            lines.append("   No veo un clausulazo suyo que te mejore hoy.")
+            lines.append("Hoy no hay un upgrade claro a tu precio.")
         lines.append("")
 
-    lines.append("Esto es lo que gana ligas: tapar el hueco, pillar lo que nadie tiene, capitán diferencial.")
+    leader = min((b for b in snap.budgets if not b.is_me), key=lambda b: b.position, default=None)
+    lines.append("<b>Jugada 3 · pega donde duele</b>")
+    if leader:
+        steals = steal_from(snap, leader.team_id)
+        if steals:
+            t = steals[0]
+            pay = "te llega" if t.affordable else "cuando tengas caja"
+            lines.append(
+                f"Líder {leader.name} ({leader.position}º). Quítale a {t.player.name} "
+                f"({money(t.cost)}, +{t.extra_xp:.1f} XI, {pay})."
+            )
+            if t.affordable:
+                btn = _target_button(t)
+                if btn:
+                    buttons.append(btn)
+        else:
+            lines.append(f"Líder {leader.name}: no tiene un clausulazo que te mejore hoy.")
+    broken = broken_rivals(weeks)
+    if broken:
+        w = broken[0]
+        bits = []
+        if w.hole:
+            bits.append(f"sin {w.hole.label}")
+        if w.dead:
+            bits.append("bajas: " + ", ".join(p.name for p in w.dead[:2]))
+        steals = steal_from(snap, w.team_id)
+        extra = f" · clávale {steals[0].player.name}" if steals else ""
+        lines.append(f"Rival roto {w.name}: {', '.join(bits) or 'proyección floja'}{extra}.")
+        if steals:
+            btn = _target_button(steals[0])
+            if btn:
+                buttons.append(btn)
+    lines.append("")
+
+    buy, sell = price_front_run(snap)
+    lines.append("<b>Jugada 4 · el precio de mañana</b>")
+    if buy:
+        lines.append("Titulares AS que ya suben (cógela antes): " + ", ".join(
+            f"{p.name} ({p.price_trend_pct:+.1f}%)" for p in buy[:3]
+        ))
+    if sell:
+        lines.append("Tus muertos de precio: " + ", ".join(
+            f"{p.name} ({p.status_emoji} {p.price_trend_pct:+.1f}%)" for p in sell[:3]
+        ))
+        for p in sell[:2]:
+            price = max(int(round(p.price * 0.98 / 1000) * 1000), 1)
+            buttons.append((f"Vender {p.name} {money(price)}", f"sell:{p.id}:{price}"))
+    if not buy and not sell:
+        lines.append("Sin movimiento claro de precio hoy.")
+    lines.append("")
+
+    snipes = empty_market(snap)
+    hunters = []
+    for p in sorted(squad, key=lambda x: predict(x), reverse=True)[:6]:
+        if p.clause:
+            names = clause_hunters(snap, int(p.clause))
+            if names:
+                hunters.append(f"{p.name} {money(p.clause)} ← {', '.join(names[:2])}")
+    lines.append("<b>Jugada 5 · no te duermas</b>")
+    if snipes:
+        t = snipes[0]
+        left = int((t.listing.until - datetime.now(timezone.utc)).total_seconds() // 60) if t.listing else 0
+        lines.append(f"Mercado vacío: {t.player.name} {money(t.cost)} · cierra en {left} min. Pújalo al cierre.")
+        close = _close_bid_button(t)
+        if close:
+            buttons.append(close)
+    if hunters:
+        lines.append("Te pueden clavar: " + " · ".join(hunters[:3]))
+    if mine and mine.dead:
+        lines.append("Muertos en tu banquillo: " + ", ".join(p.name for p in mine.dead[:3]))
+    if not snipes and not hunters and not (mine and mine.dead):
+        lines.append("Nada urgente fuera del XI.")
+    lines.append("")
+    lines.append("En esta liga un jugador solo está en un equipo. Ganas leyendo su XI, su caja y el precio.")
     buttons.append(("🔓 Cláusulas", "cmd:clausulas"))
-    buttons.append(("💶 Cajas rivales", "cmd:presupuesto"))
-    buttons.append(("🛡️ Quién me clava", "cmd:amenazas"))
+    buttons.append(("💶 Cajas", "cmd:presupuesto"))
+    buttons.append(("🛡️ Amenazas", "cmd:amenazas"))
     return "\n".join(lines).strip(), buttons
 
 

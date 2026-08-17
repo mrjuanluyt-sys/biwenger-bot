@@ -9,13 +9,19 @@ FIXTURE_SENSITIVITY = 0.6
 
 def base_per_game(player: Player, weights: list[float] | None = None) -> float:
     weights = weights or DEFAULT_WEIGHTS
-    recent = player.fitness[-len(weights) :] if player.fitness else []
+    recent = [float(x) for x in (player.fitness[-len(weights) :] if player.fitness else [])]
+    season = (player.points_last_season / SEASON_GAMES) if player.points_last_season else None
     if recent:
         used = weights[-len(recent) :]
         norm = sum(used) or 1.0
-        return sum(pts * w for pts, w in zip(reversed(recent), used)) / norm
-    if player.points_last_season:
-        return player.points_last_season / SEASON_GAMES
+        form = sum(pts * w for pts, w in zip(reversed(recent), used)) / norm
+        # 1-2 partidos no mandan: si no, un 17 de jornada 1 parece 17 eternos.
+        if season is not None and len(recent) < 5:
+            w_form = len(recent) / (len(recent) + 5)
+            return w_form * form + (1.0 - w_form) * season
+        return form
+    if season is not None:
+        return season
     if player.points:
         return player.points / max(len(player.fitness) or 1, 1)
     return 0.0
@@ -64,6 +70,11 @@ def predict(player: Player) -> float:
         expected *= 0.4
     elif player.is_doubt:
         expected *= 0.7
+    if player.sofascore is not None:
+        if player.sofascore >= 7.3:
+            expected *= 1.05
+        elif player.sofascore <= 6.1:
+            expected *= 0.95
     return round(max(expected, 0.0), 2)
 
 

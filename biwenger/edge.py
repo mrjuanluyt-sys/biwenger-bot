@@ -26,19 +26,31 @@ def apply_next_home(catalog: dict[int, Player], fixtures: dict[int, list[Upcomin
 
 
 def ownership_label(player: Player, n_managers: int) -> str:
-    n = player.ownership
-    if n <= 0:
-        return "nadie lo tiene"
-    if n == 1:
-        return "solo 1 rival"
-    pct = round(100 * n / max(n_managers, 1))
-    return f"en {n}/{n_managers} equipos ({pct}%)"
+    if player.is_owned_by_me:
+        return "tuyo"
+    if player.owner_name:
+        return f"de {player.owner_name}"
+    if player.ownership <= 0:
+        return "libre"
+    return f"de un rival"
 
 
 def captain_score(player: Player, expected: float, n_managers: int) -> float:
-    # El capitán dobla. Si casi nadie lo tiene, ganas hueco en la tabla.
-    unique = 1.0 - min(player.ownership, n_managers) / max(n_managers, 1)
-    return expected * (1.0 + 0.35 * unique)
+    """En clásico no hay template: eliges entre LOS TUYOS. Premia certeza AS + casa + fixture."""
+    score = expected
+    if player.starter_role == "starter":
+        score *= 1.10
+    elif player.starter_role == "bench":
+        score *= 0.35
+    if player.next_is_home:
+        score *= 1.05
+    if player.fixture_difficulty is not None and player.fixture_difficulty <= 35:
+        score *= 1.06
+    elif player.fixture_difficulty is not None and player.fixture_difficulty >= 70:
+        score *= 0.92
+    if player.is_doubt:
+        score *= 0.72
+    return score
 
 
 def pick_captain(lineup: LineupResult, n_managers: int) -> Player | None:
@@ -59,10 +71,17 @@ class EdgePick:
 
 
 def hole(squad: list[Player]) -> Position | None:
+    usable = [
+        p
+        for p in squad
+        if p.position != Position.COACH
+        and not p.is_injured_or_suspended
+        and p.starter_role != "out"
+        and predict(p) > 0.4
+    ]
     counts = {pos: 0 for pos in Position}
-    for p in squad:
-        if p.position != Position.COACH and not p.is_injured_or_suspended:
-            counts[p.position] += 1
+    for p in usable:
+        counts[p.position] += 1
     if counts[Position.GOALKEEPER] < 1:
         return Position.GOALKEEPER
     if counts[Position.FORWARD] < 2:

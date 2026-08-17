@@ -41,10 +41,16 @@ def test_no_keeper_is_the_hole() -> None:
     assert hole(squad) == Position.GOALKEEPER
 
 
-def test_unique_captain_beats_owned_same_xp() -> None:
-    unique = Player(1, "A", Position.FORWARD, 1, ownership=0)
-    popular = Player(2, "B", Position.FORWARD, 1, ownership=10)
-    assert captain_score(unique, 6.0, 13) > captain_score(popular, 6.0, 13)
+def test_confirmed_home_captain_beats_doubt() -> None:
+    sure = Player(1, "A", Position.FORWARD, 1, starter_role="starter", next_is_home=True, fixture_difficulty=30)
+    doubt = Player(2, "B", Position.FORWARD, 1, starter_role="unknown", status="doubt", fixture_difficulty=70)
+    assert captain_score(sure, 6.0, 13) > captain_score(doubt, 6.0, 13)
+
+
+def test_one_crazy_game_does_not_become_the_forecast() -> None:
+    hot = Player(1, "Hot", Position.FORWARD, 1, fitness=[17], points_last_season=152, starter_role="starter")
+    xp = predict(hot)
+    assert 3.0 < xp < 10.0
 
 
 def test_probable_starter_beats_bench() -> None:

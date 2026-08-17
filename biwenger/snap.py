@@ -60,8 +60,9 @@ def gather(client: BiwengerClient, force: bool = False) -> Snap:
     except Exception:
         pass
     listings, balance, max_bid = client.get_market()
-    spendable = min(balance, max_bid) if max_bid else balance
-    targets = find_targets(listings, catalog, squad, spendable)
+    market_cap = max(max_bid, 0) if max_bid else max(balance, 0)
+    clause_cash = max(balance, 0)
+    targets = find_targets(listings, catalog, squad, market_cap, clause_cash=clause_cash)
     standings = client.get_standings()
     news = client.get_season_news(SEASON_START, max_pages=16)
     moves = parse_moves(news, since=last_reset_epoch(news) or SEASON_START)
